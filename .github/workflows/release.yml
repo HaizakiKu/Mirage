@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
+        default: 'v0.0.0-test'
 
 permissions:
   contents: write
@@ -42,7 +48,9 @@ jobs:
           [[ "${{ matrix.goos }}" == "windows" ]] && SUFFIX=".exe"
           NAME="mirage-${{ matrix.goos }}-${{ matrix.goarch }}"
           [[ -n "${{ matrix.goarm }}" ]] && NAME="${NAME}v${{ matrix.goarm }}"
-          go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+          VERSION="${{ github.ref_name }}"
+          [[ "$VERSION" == "refs/heads/"* ]] && VERSION="${{ inputs.tag }}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
             -o "dist/${NAME}${SUFFIX}" ./cmd/mirage
 
       - name: Upload artifact
