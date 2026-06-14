@@ -37,20 +37,28 @@ jobs:
           go-version: '1.24'
           cache: true
 
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build
         env:
-          GOOS:   ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM:  ${{ matrix.goarm }}
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
           CGO_ENABLED: "0"
         run: |
           SUFFIX=""
           [[ "${{ matrix.goos }}" == "windows" ]] && SUFFIX=".exe"
           NAME="mirage-${{ matrix.goos }}-${{ matrix.goarch }}"
           [[ -n "${{ matrix.goarm }}" ]] && NAME="${NAME}v${{ matrix.goarm }}"
-          VERSION="${{ github.ref_name }}"
-          [[ "$VERSION" == "refs/heads/"* ]] && VERSION="${{ inputs.tag }}"
-          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X main.version=${{ steps.version.outputs.tag }}" \
             -o "dist/${NAME}${SUFFIX}" ./cmd/mirage
 
       - name: Upload artifact
@@ -66,6 +74,15 @@ jobs:
     needs: build
 
     steps:
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -81,6 +98,7 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
           files: |
             dist/*
           generate_release_notes: true
