@@ -10,8 +10,9 @@ type ServerConfig struct {
 	Listen   string `yaml:"listen"`
 	Password string `yaml:"password"` // required
 
-	TLS TLSConfig `yaml:"tls"`
-	ECH ECHConfig `yaml:"ech"`
+	TLS  TLSConfig  `yaml:"tls"`
+	ACME ACMEConfig `yaml:"acme"`
+	ECH  ECHConfig  `yaml:"ech"`
 
 	Masquerade MasqConfig `yaml:"masquerade"`
 
@@ -32,6 +33,12 @@ type ECHConfig struct {
 
 type MasqConfig struct {
 	URL string `yaml:"url"`
+}
+
+type ACMEConfig struct {
+	Domain   string `yaml:"domain"`
+	Email    string `yaml:"email"`
+	CacheDir string `yaml:"cache_dir"` // defaults to /etc/mirage/acme-cache
 }
 
 type HopConfig struct {

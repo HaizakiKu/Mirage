@@ -43,6 +43,17 @@ func ServerTLSConfig(cert tls.Certificate, echProvider *ech.Provider) *tls.Confi
 	}
 }
 
+// ServerTLSConfigDynamic builds a tls.Config that fetches certificates on demand.
+// Used for ACME mode where the cert is managed by autocert.Manager.
+func ServerTLSConfigDynamic(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), echProvider *ech.Provider) *tls.Config {
+	return &tls.Config{
+		GetCertificate:           getCert,
+		NextProtos:               []string{"h3"},
+		EncryptedClientHelloKeys: echProvider.Keys(),
+		MinVersion:               tls.VersionTLS13,
+	}
+}
+
 // ClientTLSConfig builds a tls.Config for the Mirage client.
 // If echConfigList is nil, ECH is skipped with a warning logged by the caller.
 func ClientTLSConfig(serverName string, echConfigList []byte) *tls.Config {

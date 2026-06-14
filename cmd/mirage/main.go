@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	cfgPath := flag.String("config", "config.yaml", "path to config file")
+	cfgPath := flag.String("config", "/etc/mirage.yaml", "path to config file")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -29,8 +29,8 @@ func main() {
 		if cfg.Password == "" {
 			log.Fatal("password is required in config")
 		}
-		if cfg.TLS.Cert == "" || cfg.TLS.Key == "" {
-			log.Fatal("tls.cert and tls.key are required in config")
+		if cfg.ACME.Domain == "" && (cfg.TLS.Cert == "" || cfg.TLS.Key == "") {
+			log.Fatal("either acme.domain or tls.cert+tls.key must be set in config")
 		}
 		if cfg.Masquerade.URL == "" {
 			log.Fatal("masquerade.url is required in config")

@@ -20,6 +20,7 @@ type Config struct {
 	// server
 	Listen     string     `yaml:"listen"`
 	TLS        TLSConfig  `yaml:"tls"`
+	ACME       ACMEConfig `yaml:"acme"`
 	ECH        ECHConfig  `yaml:"ech"`
 	Masquerade MasqConfig `yaml:"masquerade"`
 
@@ -54,6 +55,7 @@ func (c *Config) AsServerConfig() *ServerConfig {
 		Listen:      c.Listen,
 		Password:    c.Password,
 		TLS:         c.TLS,
+		ACME:        c.ACME,
 		ECH:         c.ECH,
 		Masquerade:  c.Masquerade,
 		PortHopping: c.PortHopping,
