@@ -6,14 +6,27 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/HaizakiKu/mirage/config"
 	"github.com/HaizakiKu/mirage/core"
 )
 
+func defaultConfigPath() string {
+	if runtime.GOOS == "windows" {
+		base := os.Getenv("ProgramData")
+		if base == "" {
+			base = `C:\ProgramData`
+		}
+		return filepath.Join(base, "mirage", "config.yaml")
+	}
+	return "/etc/mirage.yaml"
+}
+
 func main() {
-	cfgPath := flag.String("config", "/etc/mirage.yaml", "path to config file")
+	cfgPath := flag.String("config", defaultConfigPath(), "path to config file")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
