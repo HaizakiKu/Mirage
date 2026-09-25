@@ -47,7 +47,9 @@ type HopConfig struct {
 }
 
 type CongestionCfg struct {
-	// Jitter fraction (0 disables jitter)
+	// Authenticated connections always use BBR. Jitter is the ±fraction by which
+	// the BBR congestion window drifts (e.g. 0.15; values above 0.5 fall back to
+	// 0.15). 0 disables jitter.
 	Jitter float64 `yaml:"jitter"`
 }
 

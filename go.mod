@@ -15,8 +15,6 @@ require (
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/qtls-go1-20 v0.4.1 // indirect
-	golang.org/x/exp v0.0.0-20240416160154-fe59bbe5cc7f // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
@@ -25,5 +23,6 @@ require (
 // quic-ech is maintained alongside mirage
 replace github.com/HaizakiKu/quic-ech => ./quic-ech
 
-// Fork adds TLSClientConnFactory hook for uTLS Chrome fingerprint injection.
-replace github.com/quic-go/quic-go => github.com/HaizakiKu/quic-go v0.57.1-mirage.1
+// Fork adds TLSClientConnFactory hook for uTLS Chrome fingerprint injection,
+// and Conn.SetCongestionControl for installing BBR (traffic/congestion).
+replace github.com/quic-go/quic-go => github.com/HaizakiKu/quic-go v0.57.2-0.20260925080739-4dcf48ff6019
