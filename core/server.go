@@ -255,6 +255,7 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	stream, err := conn.AcceptStream(authCtx)
 	if err != nil {
 		// No stream within timeout — active probe or idle scanner
+		log.Printf("connection from %s: no request within %v, serving masquerade", conn.RemoteAddr(), s.getAuthTimeout())
 		if serveErr := s.masqSrv.ServeQUICConn(conn); serveErr != nil {
 			log.Printf("masq serve (timeout): %v", serveErr)
 		}
@@ -262,16 +263,23 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	}
 
 	hdr, err := s.readAuthHeader(stream)
-	valid := err == nil &&
-		ValidateToken(hdr.Token, s.cfg.Password) &&
-		s.tokens.markUsed(hdr.Token) // replay protection: same token rejected twice
-
-	if !valid {
+	var reason string
+	switch {
+	case err != nil:
+		reason = fmt.Sprintf("not a Mirage request (%v)", err)
+	case !ValidateToken(hdr.Token, s.cfg.Password):
+		reason = "invalid token (wrong password, or client/server clocks differ by more than 30s)"
+	case !s.tokens.markUsed(hdr.Token): // replay protection: same token rejected twice
+		reason = "replayed token"
+	}
+	if reason != "" {
+		log.Printf("connection from %s: %s, serving masquerade", conn.RemoteAddr(), reason)
 		if serveErr := s.masqSrv.ServeQUICConn(conn); serveErr != nil {
 			log.Printf("masq serve (bad auth): %v", serveErr)
 		}
 		return
 	}
+	log.Printf("client %s authenticated", conn.RemoteAddr())
 
 	// Authenticated — apply congestion controller
 	if s.cfg.Congestion.Jitter > 0 {
