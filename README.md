@@ -85,6 +85,7 @@ Supported SOCKS5 commands: CONNECT (TCP) and UDP ASSOCIATE (packets up to ~1150 
 
 | Symptom | Likely cause |
 |---|---|
+| `connect to server ...: timeout: no recent network activity` | no UDP reply from the server: it isn't running, UDP 443 is closed in the VPS firewall (`ufw allow 443/udp`) or cloud security group, or the network blocks UDP/QUIC (try another port, e.g. `listen: ":8443"`) |
 | Proxied connections close immediately | wrong password, clock drift over 30 s, or client and server on different versions |
 | `ECH config not found` warning | `ech_config` is empty; the tunnel works but without ECH |
 | TLS / certificate error on the client | `server` is an IP, or the cert isn't publicly trusted |

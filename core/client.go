@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,7 +29,8 @@ type Client struct {
 	conn  *quic.Conn
 	demux *udpDemux
 
-	rootCAs *x509.CertPool // tests only: trust a self-signed server cert
+	rootCAs          *x509.CertPool // tests only: trust a self-signed server cert
+	handshakeTimeout time.Duration  // tests only: override HandshakeIdleTimeout
 }
 
 // NewClient creates a Client. QUIC connection is established lazily
@@ -107,7 +109,7 @@ func (c *Client) handleSOCKS5(ctx context.Context, rawConn net.Conn) {
 func (c *Client) handleConnect(ctx context.Context, rawConn net.Conn, host string, port uint16) {
 	stream, _, err := c.openStream(ctx)
 	if err != nil {
-		log.Printf("open QUIC stream: %v", err)
+		log.Printf("CONNECT %s: %v", net.JoinHostPort(host, fmt.Sprint(port)), err)
 		socks5SendReply(rawConn, socks5RepConnRefused, nil)
 		return
 	}
@@ -166,7 +168,7 @@ func (c *Client) handleUDPAssociate(ctx context.Context, rawConn net.Conn) {
 
 	stream, demux, err := c.openStream(ctx)
 	if err != nil {
-		log.Printf("open QUIC stream: %v", err)
+		log.Printf("UDP associate: %v", err)
 		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
 		return
 	}
@@ -325,7 +327,28 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 	if c.rootCAs != nil {
 		tlsCfg.RootCAs = c.rootCAs
 	}
-	return NewQUICClient(ctx, server, tlsCfg)
+	qcfg := quicClientConfig
+	if c.handshakeTimeout > 0 {
+		qcfg = quicClientConfig.Clone()
+		qcfg.HandshakeIdleTimeout = c.handshakeTimeout
+	}
+	conn, err := quic.DialAddr(ctx, server, tlsCfg, qcfg)
+	if err != nil {
+		return nil, dialError(server, err)
+	}
+	return conn, nil
+}
+
+// dialError wraps a connection failure with the server address and, when no
+// reply ever arrived, a hint about the most common cause.
+func dialError(server string, err error) error {
+	var idle *quic.IdleTimeoutError
+	var hs *quic.HandshakeTimeoutError
+	if errors.As(err, &idle) || errors.As(err, &hs) {
+		_, port, _ := net.SplitHostPort(server)
+		return fmt.Errorf("connect to server %s: %w (no reply from server over UDP: check the server is running and UDP port %s is open in its firewall / cloud security group)", server, err, port)
+	}
+	return fmt.Errorf("connect to server %s: %w", server, err)
 }
 
 func isConnClosed(conn *quic.Conn) bool {

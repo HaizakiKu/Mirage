@@ -14,6 +14,7 @@ import (
 // quicClientConfig is used for outbound Mirage connections.
 // TLSClientConnFactory injects a Chrome-fingerprinted TLS handshake via uTLS.
 var quicClientConfig = &quic.Config{
+	HandshakeIdleTimeout:    10 * time.Second, // first ACME issuance can take several seconds
 	MaxIdleTimeout:          30 * time.Second,
 	KeepAlivePeriod:         10 * time.Second,
 	MaxIncomingStreams:       1024,
