@@ -108,7 +108,9 @@ func fetch(client *http.Client, url string) (CachedPage, error) {
 
 	// Strip hop-by-hop headers not suitable for caching
 	h := resp.Header.Clone()
-	for _, hdr := range []string{"Transfer-Encoding", "Connection", "Keep-Alive", "Upgrade"} {
+	// Content-Length is dropped too: the body may be truncated by the cap above,
+	// and the HTTP/3 server computes the correct length itself.
+	for _, hdr := range []string{"Transfer-Encoding", "Connection", "Keep-Alive", "Upgrade", "Content-Length"} {
 		h.Del(hdr)
 	}
 

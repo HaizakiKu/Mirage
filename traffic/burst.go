@@ -9,11 +9,11 @@ import (
 )
 
 const (
-	minBurstBytes  = 50 * 1024  // 50 KB
-	maxBurstBytes  = 500 * 1024 // 500 KB
-	minSilenceMs   = 200
-	maxSilenceMs   = 2000
-	queueBufSize   = 256
+	minBurstBytes = 50 * 1024  // 50 KB
+	maxBurstBytes = 500 * 1024 // 500 KB
+	minSilenceMs  = 200
+	maxSilenceMs  = 2000
+	queueBufSize  = 256
 )
 
 // BurstController shapes transmission timing to match human browsing patterns:
@@ -28,8 +28,12 @@ type BurstController struct {
 	inner  io.WriteCloser
 	queue  chan []byte
 	rng    *rand.Rand
-	wg     sync.WaitGroup
-	closed chan struct{}
+	closed chan struct{} // closed by Close
+	done   chan struct{} // closed when loop exits
+	once   sync.Once
+
+	errMu sync.Mutex
+	err   error // first error from inner.Write
 }
 
 func newBurstController(w io.WriteCloser) *BurstController {
@@ -38,8 +42,8 @@ func newBurstController(w io.WriteCloser) *BurstController {
 		queue:  make(chan []byte, queueBufSize),
 		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
 		closed: make(chan struct{}),
+		done:   make(chan struct{}),
 	}
-	b.wg.Add(1)
 	go b.loop()
 	return b
 }
@@ -54,21 +58,54 @@ func (b *BurstController) Write(p []byte) (int, error) {
 		return len(p), nil
 	case <-b.closed:
 		return 0, io.ErrClosedPipe
+	case <-b.done:
+		// loop stopped after an inner write error; don't block forever
+		if err := b.loadErr(); err != nil {
+			return 0, err
+		}
+		return 0, io.ErrClosedPipe
 	}
 }
 
+// Close flushes all queued data to the inner writer, then closes it.
 func (b *BurstController) Close() error {
-	select {
-	case <-b.closed:
-	default:
-		close(b.closed)
-	}
-	b.wg.Wait()
+	b.once.Do(func() { close(b.closed) })
+	<-b.done
 	return b.inner.Close()
 }
 
+func (b *BurstController) loadErr() error {
+	b.errMu.Lock()
+	defer b.errMu.Unlock()
+	return b.err
+}
+
+func (b *BurstController) write(chunk []byte) bool {
+	if _, err := b.inner.Write(chunk); err != nil {
+		b.errMu.Lock()
+		b.err = err
+		b.errMu.Unlock()
+		return false
+	}
+	return true
+}
+
+// drain writes out everything still queued. Called once Close was requested.
+func (b *BurstController) drain() {
+	for {
+		select {
+		case chunk := <-b.queue:
+			if !b.write(chunk) {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
 func (b *BurstController) loop() {
-	defer b.wg.Done()
+	defer close(b.done)
 
 	for {
 		// Burst phase: send up to burstSize bytes
@@ -76,36 +113,30 @@ func (b *BurstController) loop() {
 		sent := 0
 
 		for sent < burstSize {
-			select {
-			case chunk := <-b.queue:
-				if _, err := b.inner.Write(chunk); err != nil {
+			var chunk []byte
+			if sent == 0 {
+				// Idle: wait for data to start the next burst.
+				select {
+				case chunk = <-b.queue:
+				case <-b.closed:
+					b.drain()
 					return
 				}
-				sent += len(chunk)
-			case <-b.closed:
-				// Drain remaining
-				for {
-					select {
-					case chunk := <-b.queue:
-						_, _ = b.inner.Write(chunk)
-					default:
-						return
-					}
-				}
-			default:
-				// Queue empty — wait for data briefly before ending burst
+			} else {
+				// Mid-burst: end the burst if the queue stays empty briefly.
 				select {
-				case chunk := <-b.queue:
-					if _, err := b.inner.Write(chunk); err != nil {
-						return
-					}
-					sent += len(chunk)
+				case chunk = <-b.queue:
 				case <-time.After(5 * time.Millisecond):
 					goto silence
 				case <-b.closed:
+					b.drain()
 					return
 				}
 			}
+			if !b.write(chunk) {
+				return
+			}
+			sent += len(chunk)
 		}
 
 	silence:
@@ -114,6 +145,7 @@ func (b *BurstController) loop() {
 		select {
 		case <-time.After(time.Duration(silenceMs) * time.Millisecond):
 		case <-b.closed:
+			b.drain()
 			return
 		}
 	}
