@@ -2,7 +2,9 @@ package traffic
 
 import (
 	"bytes"
+	"io"
 	"testing"
+	"time"
 )
 
 // TestPacketSizeDistribution verifies the browse profile bucket probabilities
@@ -83,3 +85,83 @@ func TestPaddingMTUCap(t *testing.T) {
 		}
 	}
 }
+
+// TestPaddedRoundTrip verifies PaddedReader recovers exactly the bytes written
+// through PaddingWriter, for writes of many sizes.
+func TestPaddedRoundTrip(t *testing.T) {
+	var wire bytes.Buffer
+	pw := newPaddingWriter(&wire, browseProfile)
+
+	var want []byte
+	for i := 0; i < 300; i++ {
+		chunk := make([]byte, (i*37)%5000)
+		for j := range chunk {
+			chunk[j] = byte(i + j)
+		}
+		want = append(want, chunk...)
+		if _, err := pw.Write(chunk); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if wire.Len() <= len(want) {
+		t.Fatalf("expected padding overhead: wire=%d payload=%d", wire.Len(), len(want))
+	}
+
+	got, err := io.ReadAll(NewPaddedReader(&wire))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("round trip mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+// TestBurstCloseFlushes verifies Close delivers all queued data.
+func TestBurstCloseFlushes(t *testing.T) {
+	sink := &closeBuffer{}
+	b := newBurstController(sink)
+	var want []byte
+	for i := 0; i < 200; i++ {
+		chunk := bytes.Repeat([]byte{byte(i)}, 1000)
+		want = append(want, chunk...)
+		b.Write(chunk) //nolint:errcheck
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !bytes.Equal(sink.Bytes(), want) || !sink.closed {
+		t.Fatalf("flushed %d/%d bytes, closed=%v", sink.Len(), len(want), sink.closed)
+	}
+}
+
+// TestBurstWriteAfterInnerError verifies Write does not block forever once the
+// inner writer has failed.
+func TestBurstWriteAfterInnerError(t *testing.T) {
+	b := newBurstController(failWriter{})
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < queueBufSize*2; i++ {
+			if _, err := b.Write([]byte("x")); err != nil {
+				break
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write blocked after inner writer failed")
+	}
+}
+
+type closeBuffer struct {
+	bytes.Buffer
+	closed bool
+}
+
+func (c *closeBuffer) Close() error { c.closed = true; return nil }
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+func (failWriter) Close() error              { return nil }

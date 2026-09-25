@@ -1,12 +1,17 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/HaizakiKu/mirage/config"
 	"github.com/HaizakiKu/mirage/traffic"
@@ -19,8 +24,11 @@ type Client struct {
 	cfg    *config.ClientConfig
 	shaper *traffic.TrafficShaper
 
-	mu   sync.Mutex
-	conn *quic.Conn
+	mu    sync.Mutex
+	conn  *quic.Conn
+	demux *udpDemux
+
+	rootCAs *x509.CertPool // tests only: trust a self-signed server cert
 }
 
 // NewClient creates a Client. QUIC connection is established lazily
@@ -47,9 +55,13 @@ func (c *Client) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("SOCKS5 listen %s: %w", listen, err)
 	}
-	defer ln.Close()
-
 	log.Printf("mirage client SOCKS5 listening on %s", listen)
+	return c.serve(ctx, ln)
+}
+
+// serve accepts SOCKS5 connections on ln until ctx is done. Called by Run and by tests
+func (c *Client) serve(ctx context.Context, ln net.Listener) error {
+	defer ln.Close()
 
 	go func() {
 		<-ctx.Done()
@@ -75,34 +87,53 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) handleSOCKS5(ctx context.Context, rawConn net.Conn) {
 	defer rawConn.Close()
 
-	target, cmd, err := socks5Handshake(rawConn)
+	host, port, cmd, err := socks5Handshake(rawConn)
 	if err != nil {
 		log.Printf("SOCKS5 handshake: %v", err)
 		return
 	}
 
-	stream, err := c.openStream(ctx)
+	switch cmd {
+	case socks5CmdConnect:
+		c.handleConnect(ctx, rawConn, host, port)
+	case socks5CmdUDP:
+		c.handleUDPAssociate(ctx, rawConn)
+	default:
+		socks5SendReply(rawConn, socks5RepCmdNotSupported, nil)
+	}
+}
+
+// handleConnect proxies a SOCKS5 CONNECT request over a new QUIC stream.
+func (c *Client) handleConnect(ctx context.Context, rawConn net.Conn, host string, port uint16) {
+	stream, _, err := c.openStream(ctx)
 	if err != nil {
 		log.Printf("open QUIC stream: %v", err)
-		socks5SendError(rawConn)
+		socks5SendReply(rawConn, socks5RepConnRefused, nil)
 		return
 	}
-	defer stream.Close()
-
-	// Wrap stream write path with traffic shaping
-	shaped := c.shaper.WrapStream(stream)
 
 	command := CmdTCP
-	if cmd == socks5CmdUDP {
-		command = CmdUDP
+	if c.shaper.Enabled() {
+		command |= CmdFlagPadded
 	}
-
-	addrType, addr, port, err := parseSOCKS5Target(target)
-	if err != nil {
-		log.Printf("parse target: %v", err)
+	if err := c.writeHeader(stream, command, host, port); err != nil {
+		log.Printf("send auth header: %v", err)
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
 		return
 	}
 
+	// Only the payload after the header is shaped (and padding-framed).
+	shaped := c.shaper.WrapStream(stream)
+
+	socks5SendReply(rawConn, socks5RepSuccess, nil)
+	relay(ctx, stream, stream, shaped, rawConn)
+}
+
+// writeHeader sends the auth header, unshaped, as the first bytes of stream.
+func (c *Client) writeHeader(stream *quic.Stream, command Command, host string, port uint16) error {
+	addrType, addr := addrTypeFor(host)
 	hdr := &AuthHeader{
 		Version:  Version,
 		Token:    MakeToken(c.cfg.Password),
@@ -111,53 +142,166 @@ func (c *Client) handleSOCKS5(ctx context.Context, rawConn net.Conn) {
 		Addr:     addr,
 		Port:     port,
 	}
+	_, err := stream.Write(hdr.Encode())
+	return err
+}
 
-	if _, err := shaped.Write(hdr.Encode()); err != nil {
-		log.Printf("send auth header: %v", err)
+// handleUDPAssociate implements SOCKS5 UDP ASSOCIATE. Packets from the
+// application are relayed as QUIC datagrams tagged with the session ID (the
+// control stream's ID); the association ends when the SOCKS TCP connection closes.
+func (c *Client) handleUDPAssociate(ctx context.Context, rawConn net.Conn) {
+	tcpClient, _ := rawConn.RemoteAddr().(*net.TCPAddr)
+	localTCP, _ := rawConn.LocalAddr().(*net.TCPAddr)
+	var bindIP net.IP
+	if localTCP != nil {
+		bindIP = localTCP.IP
+	}
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP})
+	if err != nil {
+		log.Printf("UDP associate listen: %v", err)
+		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
 		return
 	}
+	defer pc.Close()
 
-	socks5SendSuccess(rawConn, target)
-
-	done := make(chan struct{}, 2)
-	go func() {
-		io.Copy(shaped, rawConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		io.Copy(rawConn, shaped)
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
+	stream, demux, err := c.openStream(ctx)
+	if err != nil {
+		log.Printf("open QUIC stream: %v", err)
+		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
+		return
 	}
+	defer func() {
+		stream.CancelRead(0)
+		stream.Close()
+	}()
+
+	id := uint32(stream.StreamID())
+	in := demux.register(id)
+	defer demux.unregister(id)
+
+	if err := c.writeHeader(stream, CmdUDP, "0.0.0.0", 0); err != nil {
+		log.Printf("send auth header: %v", err)
+		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
+		return
+	}
+	// Wait for the server to register the session.
+	var ack [1]byte
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	if _, err := io.ReadFull(stream, ack[:]); err != nil {
+		log.Printf("UDP associate: no server ack: %v", err)
+		socks5SendReply(rawConn, socks5RepGeneralFailure, nil)
+		return
+	}
+	stream.SetReadDeadline(time.Time{}) //nolint:errcheck
+
+	socks5SendReply(rawConn, socks5RepSuccess, pc.LocalAddr().(*net.UDPAddr))
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(demux.conn.Context(), cancel)
+	defer stop()
+	go func() {
+		// Server closed the control stream or the TCP side went away.
+		io.Copy(io.Discard, stream) //nolint:errcheck
+		cancel()
+	}()
+	go func() {
+		<-sctx.Done()
+		rawConn.Close()
+		pc.Close()
+	}()
+
+	var appAddr atomic.Pointer[net.UDPAddr]
+
+	// application → server
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				cancel()
+				return
+			}
+			if tcpClient != nil && !from.IP.Equal(tcpClient.IP) {
+				continue // only the client that made the association may use it
+			}
+			// SOCKS5 UDP request header: RSV(2) FRAG(1) ATYP DST.ADDR DST.PORT DATA
+			if n < 4 || buf[2] != 0 {
+				continue // fragmentation is not supported
+			}
+			r := &sliceReader{b: buf[3:n]}
+			t, addr, port, err := readAddr(r) // SOCKS5 ATYP values match AddrType
+			if err != nil {
+				continue
+			}
+			appAddr.Store(from)
+			demux.conn.SendDatagram(EncodeUDPDatagram(id, t, addr, port, r.b)) //nolint:errcheck
+		}
+	}()
+
+	// server → application
+	go func() {
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case data := <-in:
+				d, err := DecodeUDPDatagram(data)
+				if err != nil {
+					continue
+				}
+				to := appAddr.Load()
+				if to == nil {
+					continue
+				}
+				pkt := appendAddr([]byte{0, 0, 0}, d.AddrType, d.Addr, d.Port)
+				pc.WriteToUDP(append(pkt, d.Payload...), to) //nolint:errcheck
+			}
+		}
+	}()
+
+	// RFC 1928: the association terminates when the TCP connection closes.
+	io.Copy(io.Discard, rawConn) //nolint:errcheck
+	cancel()
 }
 
 // openStream opens a new QUIC stream, reconnecting if needed
-func (c *Client) openStream(ctx context.Context) (*quic.Stream, error) {
+func (c *Client) openStream(ctx context.Context) (*quic.Stream, *udpDemux, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if c.conn == nil || isConnClosed(c.conn) {
-		conn, err := c.dial(ctx)
-		if err != nil {
-			return nil, err
+		if err := c.redial(ctx); err != nil {
+			return nil, nil, err
 		}
-		c.conn = conn
 	}
 
 	stream, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
-		conn, dialErr := c.dial(ctx)
-		if dialErr != nil {
-			return nil, fmt.Errorf("reconnect: %w", dialErr)
+		if err := c.redial(ctx); err != nil {
+			return nil, nil, fmt.Errorf("reconnect: %w", err)
 		}
-		c.conn = conn
-		return c.conn.OpenStreamSync(ctx)
+		stream, err = c.conn.OpenStreamSync(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	return stream, nil
+	return stream, c.demux, nil
+}
+
+// redial replaces the current connection. Must be called with c.mu held.
+func (c *Client) redial(ctx context.Context) error {
+	if c.conn != nil {
+		c.conn.CloseWithError(0, "") //nolint:errcheck
+		c.conn, c.demux = nil, nil
+	}
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	c.demux = newUDPDemux(conn)
+	return nil
 }
 
 func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
@@ -178,6 +322,9 @@ func (c *Client) dial(ctx context.Context) (*quic.Conn, error) {
 	}
 
 	tlsCfg := ClientTLSConfig(host, echBytes)
+	if c.rootCAs != nil {
+		tlsCfg.RootCAs = c.rootCAs
+	}
 	return NewQUICClient(ctx, server, tlsCfg)
 }
 
@@ -190,30 +337,94 @@ func isConnClosed(conn *quic.Conn) bool {
 	}
 }
 
+// udpDemux dispatches the QUIC datagrams of one client connection to the
+// UDP associations (keyed by session ID) that share it.
+type udpDemux struct {
+	conn *quic.Conn
+	once sync.Once
+
+	mu       sync.Mutex
+	sessions map[uint32]chan []byte
+}
+
+func newUDPDemux(conn *quic.Conn) *udpDemux {
+	return &udpDemux{conn: conn, sessions: make(map[uint32]chan []byte)}
+}
+
+func (d *udpDemux) register(id uint32) <-chan []byte {
+	ch := make(chan []byte, 128)
+	d.mu.Lock()
+	d.sessions[id] = ch
+	d.mu.Unlock()
+	d.once.Do(func() { go d.loop() })
+	return ch
+}
+
+func (d *udpDemux) unregister(id uint32) {
+	d.mu.Lock()
+	delete(d.sessions, id)
+	d.mu.Unlock()
+}
+
+func (d *udpDemux) loop() {
+	for {
+		data, err := d.conn.ReceiveDatagram(d.conn.Context())
+		if err != nil {
+			return
+		}
+		if len(data) < 4 {
+			continue
+		}
+		id := binary.BigEndian.Uint32(data)
+		d.mu.Lock()
+		ch := d.sessions[id]
+		d.mu.Unlock()
+		if ch == nil {
+			continue
+		}
+		select {
+		case ch <- data:
+		default: // backlogged: drop, as UDP would
+		}
+	}
+}
+
 //Minimal SOCKS5 implementation
 
 const (
-	socks5Version = 0x05
-	socks5NoAuth  = 0x00
-	socks5CmdTCP  = 0x01
-	socks5CmdUDP  = 0x03
+	socks5Version    = 0x05
+	socks5NoAuth     = 0x00
+	socks5NoAccepted = 0xFF
+
+	socks5CmdConnect = 0x01
+	socks5CmdUDP     = 0x03
 
 	socks5AddrIPv4   = 0x01
 	socks5AddrDomain = 0x03
 	socks5AddrIPv6   = 0x04
+
+	socks5RepSuccess         = 0x00
+	socks5RepGeneralFailure  = 0x01
+	socks5RepConnRefused     = 0x05
+	socks5RepCmdNotSupported = 0x07
 )
 
-func socks5Handshake(conn net.Conn) (target string, cmd byte, err error) {
+// socks5Handshake performs method negotiation and reads the request.
+func socks5Handshake(conn net.Conn) (host string, port uint16, cmd byte, err error) {
 	header := make([]byte, 2)
 	if _, err = io.ReadFull(conn, header); err != nil {
 		return
 	}
 	if header[0] != socks5Version {
-		return "", 0, fmt.Errorf("unsupported SOCKS version: %d", header[0])
+		return "", 0, 0, fmt.Errorf("unsupported SOCKS version: %d", header[0])
 	}
 	methods := make([]byte, header[1])
 	if _, err = io.ReadFull(conn, methods); err != nil {
 		return
+	}
+	if !bytes.Contains(methods, []byte{socks5NoAuth}) {
+		conn.Write([]byte{socks5Version, socks5NoAccepted}) //nolint:errcheck
+		return "", 0, 0, fmt.Errorf("client offers no supported auth method")
 	}
 	conn.Write([]byte{socks5Version, socks5NoAuth}) //nolint:errcheck
 
@@ -221,9 +432,11 @@ func socks5Handshake(conn net.Conn) (target string, cmd byte, err error) {
 	if _, err = io.ReadFull(conn, req); err != nil {
 		return
 	}
+	if req[0] != socks5Version {
+		return "", 0, 0, fmt.Errorf("unsupported SOCKS version: %d", req[0])
+	}
 	cmd = req[1]
 
-	var host string
 	switch req[3] {
 	case socks5AddrIPv4:
 		ip := make([]byte, 4)
@@ -248,43 +461,26 @@ func socks5Handshake(conn net.Conn) (target string, cmd byte, err error) {
 		}
 		host = string(domain)
 	default:
-		return "", 0, fmt.Errorf("unsupported address type: 0x%02x", req[3])
+		socks5SendReply(conn, 0x08, nil) // address type not supported
+		return "", 0, 0, fmt.Errorf("unsupported address type: 0x%02x", req[3])
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err = io.ReadFull(conn, portBuf); err != nil {
 		return
 	}
-	port := int(portBuf[0])<<8 | int(portBuf[1])
-	target = fmt.Sprintf("%s:%d", host, port)
+	port = binary.BigEndian.Uint16(portBuf)
 	return
 }
 
-func parseSOCKS5Target(target string) (AddrType, string, uint16, error) {
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		return 0, "", 0, err
+// socks5SendReply writes a SOCKS5 reply; bind may be nil (reported as 0.0.0.0:0).
+func socks5SendReply(conn net.Conn, rep byte, bind *net.UDPAddr) {
+	reply := []byte{socks5Version, rep, 0x00}
+	if bind == nil {
+		reply = append(reply, socks5AddrIPv4, 0, 0, 0, 0, 0, 0)
+	} else {
+		t, host := addrTypeFor(bind.IP.String())
+		reply = appendAddr(reply, t, host, uint16(bind.Port))
 	}
-
-	var port int
-	fmt.Sscan(portStr, &port)
-
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return AddrHostname, host, uint16(port), nil
-	}
-	if ip4 := ip.To4(); ip4 != nil {
-		return AddrIPv4, host, uint16(port), nil
-	}
-	return AddrIPv6, host, uint16(port), nil
-}
-
-func socks5SendSuccess(conn net.Conn, _ string) {
-	reply := []byte{socks5Version, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
-	conn.Write(reply) //nolint:errcheck
-}
-
-func socks5SendError(conn net.Conn) {
-	reply := []byte{socks5Version, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	conn.Write(reply) //nolint:errcheck
 }

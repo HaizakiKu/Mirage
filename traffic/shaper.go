@@ -18,9 +18,13 @@ func New(cfg Config) *TrafficShaper {
 	return &TrafficShaper{cfg: cfg}
 }
 
+// Enabled reports whether WrapStream applies shaping (and thus padding frames).
+func (s *TrafficShaper) Enabled() bool { return s.cfg.Enabled }
+
 // WrapStream wraps a stream's io.ReadWriteCloser with traffic shaping layers.
 // Returns the original stream unchanged if shaping is disabled.
 // The returned value shadows Write/Close; all Read calls go to the original.
+// Written data is padding-framed; the peer must read it through PaddedReader.
 func (s *TrafficShaper) WrapStream(rw io.ReadWriteCloser) io.ReadWriteCloser {
 	if !s.cfg.Enabled {
 		return rw

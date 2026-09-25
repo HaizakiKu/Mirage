@@ -83,11 +83,30 @@ func TestAuthHeaderEncodeDecodeIPv6(t *testing.T) {
 	}
 }
 
-func TestMakeTokenConsistency(t *testing.T) {
+func TestMakeTokenUnique(t *testing.T) {
 	t1 := MakeToken("password")
 	t2 := MakeToken("password")
-	if t1 != t2 {
-		t.Error("tokens made in the same 30s window must match")
+	if t1 == t2 {
+		t.Error("tokens must carry a fresh nonce so reconnects are not seen as replays")
+	}
+	if !ValidateToken(t1, "password") || !ValidateToken(t2, "password") {
+		t.Error("both tokens made in the same window must validate")
+	}
+}
+
+func TestValidateTokenNextWindow(t *testing.T) {
+	now := time.Now().Unix() / 30
+	next := tokenForBucket("pw", now+1)
+	if !ValidateToken(next, "pw") {
+		t.Error("next bucket token must validate (client clock slightly ahead)")
+	}
+}
+
+func TestValidateTokenTampered(t *testing.T) {
+	tok := MakeToken("pw")
+	tok[0] ^= 0xff // nonce no longer matches the MAC
+	if ValidateToken(tok, "pw") {
+		t.Error("token with modified nonce must be rejected")
 	}
 }
 
@@ -128,6 +147,37 @@ func TestVersionMismatch(t *testing.T) {
 	_, err := DecodeAuthHeader(bytes.NewReader(bad))
 	if err == nil {
 		t.Error("expected error for version mismatch")
+	}
+}
+
+func TestTargetAddrIPv6(t *testing.T) {
+	h := &AuthHeader{Addr: "2001:db8::1", Port: 443}
+	if got := h.TargetAddr(); got != "[2001:db8::1]:443" {
+		t.Errorf("TargetAddr: want [2001:db8::1]:443 got %s", got)
+	}
+}
+
+func TestUDPDatagramRoundTrip(t *testing.T) {
+	payload := []byte("dns-query")
+	for _, tc := range []struct {
+		t    AddrType
+		addr string
+	}{{AddrIPv4, "10.1.2.3"}, {AddrIPv6, "2001:db8::2"}, {AddrHostname, "example.com"}} {
+		b := EncodeUDPDatagram(7, tc.t, tc.addr, 53, payload)
+		d, err := DecodeUDPDatagram(b)
+		if err != nil {
+			t.Fatalf("%s: decode: %v", tc.addr, err)
+		}
+		if d.Session != 7 || d.AddrType != tc.t || d.Addr != tc.addr || d.Port != 53 || !bytes.Equal(d.Payload, payload) {
+			t.Errorf("%s: round trip mismatch: %+v", tc.addr, d)
+		}
+	}
+}
+
+func TestPaddedFlag(t *testing.T) {
+	h := &AuthHeader{Command: CmdTCP | CmdFlagPadded}
+	if h.Cmd() != CmdTCP || !h.Padded() {
+		t.Errorf("flag decode: cmd=%d padded=%v", h.Cmd(), h.Padded())
 	}
 }
 
