@@ -88,6 +88,7 @@ Supported SOCKS5 commands: CONNECT (TCP) and UDP ASSOCIATE (packets up to ~1150 
 | `connect to server ...: timeout: no recent network activity` | no UDP reply from the server: it isn't running, UDP 443 is closed in the VPS firewall (`ufw allow 443/udp`) or cloud security group, or the network blocks UDP/QUIC (try another port, e.g. `listen: ":8443"`) |
 | Proxied connections close immediately | wrong password, clock drift over 30 s, or client and server on different versions |
 | `ECH config not found` warning | `ech_config` is empty; the tunnel works but without ECH |
+| Server logs `ACME ERROR` / `ACME WARNING: cannot listen on TCP :80`; client logs `the server rejected the TLS handshake` | Let's Encrypt can't validate the domain: HTTP-01 needs TCP port 80 free on the server (stop nginx/apache there, or use `tls.cert`/`tls.key`). Mirage retries in the background and logs `certificate ... ready` once it succeeds |
 | TLS / certificate error on the client | `server` is an IP, or the cert isn't publicly trusted |
 | Server exits at startup | `masquerade.url` unreachable, or port 80/443 already in use |
 

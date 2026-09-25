@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/HaizakiKu/mirage/config"
@@ -71,6 +72,11 @@ func NewServer(cfg *config.ServerConfig) (*Server, error) {
 
 // startACME creates an autocert.Manager for the given domain and starts an HTTP-01
 // challenge listener on :80. Returns the GetCertificate callback for tls.Config.
+//
+// The certificate is obtained in the background at startup rather than inside
+// a client's handshake: autocert would otherwise block each handshake for up to
+// minutes while issuance runs (or fails), which clients only see as
+// "timeout: no recent network activity" and the server never logs.
 func startACME(cfg config.ACMEConfig) (func(*tls.ClientHelloInfo) (*tls.Certificate, error), error) {
 	cacheDir := cfg.CacheDir
 	if cacheDir == "" {
@@ -87,16 +93,93 @@ func startACME(cfg config.ACMEConfig) (func(*tls.ClientHelloInfo) (*tls.Certific
 		Email:      cfg.Email,
 	}
 
-	// HTTP-01 challenge server — must listen on :80 for Let's Encrypt to reach it
-	go func() {
-		srv := &http.Server{Addr: ":80", Handler: m.HTTPHandler(nil)}
-		if err := srv.ListenAndServe(); err != nil {
-			log.Printf("acme http-01 listener: %v", err)
-		}
-	}()
-
 	log.Printf("ACME: managing certificate for %s (cache: %s)", cfg.Domain, cacheDir)
-	return m.GetCertificate, nil
+
+	// HTTP-01 challenge server — must listen on :80 for Let's Encrypt to reach it
+	if ln, err := net.Listen("tcp", ":80"); err != nil {
+		log.Printf("ACME WARNING: cannot listen on TCP :80 (%v). Let's Encrypt HTTP-01 validation "+
+			"needs port 80 on this host: stop the service using it, or use tls.cert/tls.key instead of acme. "+
+			"Only an already cached certificate can be used.", err)
+	} else {
+		go func() {
+			srv := &http.Server{Handler: m.HTTPHandler(nil)}
+			if err := srv.Serve(ln); err != nil {
+				log.Printf("acme http-01 listener: %v", err)
+			}
+		}()
+	}
+
+	ac := newACMECert(cfg.Domain, m.GetCertificate)
+	go ac.obtainLoop()
+	return ac.GetCertificate, nil
+}
+
+// acmeCert gates handshakes on a certificate that has already been obtained.
+type acmeCert struct {
+	domain string
+	get    func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	ready  atomic.Bool
+
+	logMu   sync.Mutex
+	lastLog time.Time
+}
+
+func newACMECert(domain string, get func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *acmeCert {
+	return &acmeCert{domain: domain, get: get}
+}
+
+// obtainLoop fetches the certificate (from cache or Let's Encrypt), retrying
+// with backoff until it succeeds. Renewals are then handled by autocert itself.
+func (a *acmeCert) obtainLoop() {
+	backoff := 2 * time.Minute
+	for {
+		// An empty ClientHello selects the same (RSA) key type that autocert
+		// picks for TLS 1.3/QUIC clients, so later handshakes hit this cert.
+		start := time.Now()
+		if _, err := a.get(&tls.ClientHelloInfo{ServerName: a.domain}); err == nil {
+			a.ready.Store(true)
+			log.Printf("ACME: certificate for %s ready (%v)", a.domain, time.Since(start).Round(time.Millisecond))
+			return
+		} else {
+			log.Printf("ACME ERROR: cannot obtain certificate for %s: %v — clients cannot connect until this succeeds; retrying in %v", a.domain, err, backoff)
+		}
+		time.Sleep(backoff)
+		if backoff < time.Hour {
+			backoff *= 2
+		}
+	}
+}
+
+// GetCertificate is the tls.Config callback. Before the certificate exists it
+// fails the handshake immediately instead of blocking it on issuance.
+func (a *acmeCert) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if !a.ready.Load() {
+		a.logf("ACME: rejecting handshake from %v: certificate for %s not obtained yet", remoteAddr(hello), a.domain)
+		return nil, fmt.Errorf("acme: certificate for %s not ready", a.domain)
+	}
+	cert, err := a.get(hello)
+	if err != nil {
+		a.logf("TLS handshake from %v (SNI %q): certificate error: %v", remoteAddr(hello), hello.ServerName, err)
+	}
+	return cert, err
+}
+
+// logf logs at most once per 10s so a stream of failing handshakes can't flood the log.
+func (a *acmeCert) logf(format string, args ...any) {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	if time.Since(a.lastLog) < 10*time.Second {
+		return
+	}
+	a.lastLog = time.Now()
+	log.Printf(format, args...)
+}
+
+func remoteAddr(hello *tls.ClientHelloInfo) any {
+	if hello != nil && hello.Conn != nil {
+		return hello.Conn.RemoteAddr()
+	}
+	return "client"
 }
 
 // newServerInternal constructs a Server with pre-built dependencies
@@ -126,7 +209,7 @@ func (s *Server) Run(ctx context.Context) error {
 	} else {
 		tlsCfg = ServerTLSConfig(s.cert, s.echProv)
 	}
-	ln, err := NewQUICServer(s.cfg.Listen, tlsCfg)
+	ln, err := newQUICListener(s.cfg.Listen, tlsCfg, statelessResetKey(s.cfg.Password))
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", s.cfg.Listen, err)
 	}

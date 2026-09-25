@@ -348,6 +348,10 @@ func dialError(server string, err error) error {
 		_, port, _ := net.SplitHostPort(server)
 		return fmt.Errorf("connect to server %s: %w (no reply from server over UDP: check the server is running and UDP port %s is open in its firewall / cloud security group)", server, err, port)
 	}
+	var te *quic.TransportError
+	if errors.As(err, &te) && te.Remote && te.ErrorCode.IsCryptoError() {
+		return fmt.Errorf("connect to server %s: %w (the server rejected the TLS handshake: check the server log, e.g. its certificate is not available)", server, err)
+	}
 	return fmt.Errorf("connect to server %s: %w", server, err)
 }
 
