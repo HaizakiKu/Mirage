@@ -93,7 +93,7 @@ congestion:
 # CLIENT MODE — replace everything above with the following when mode: client
 # ─────────────────────────────────────────────────────────────────────────────
 # mode: client
-# server: "example.com:443"
+# server: "example.com:443"   # domain name (not an IP): the TLS cert is verified against it
 # password: "your-password-here"
 # ech_config: ""        # base64 string printed by the server on first start
 # socks5_listen: "127.0.0.1:1080"
