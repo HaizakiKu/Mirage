@@ -631,3 +631,118 @@ func TestUTLSChromeFingerprint(t *testing.T) {
 	}
 	t.Log("uTLS Chrome fingerprint handshake succeeded")
 }
+
+// TestACMECertNotReadyFailsFast: before the ACME certificate exists, handshakes
+// must fail at once instead of blocking on issuance (which clients only saw as
+// "timeout: no recent network activity").
+func TestACMECertNotReadyFailsFast(t *testing.T) {
+	cert, pool := generateTestCert(t)
+	echProv, err := echpkg.NewProvider("example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	ac := newACMECert("localhost", func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		<-release // issuance in progress (e.g. HTTP-01 validation hanging)
+		return &cert, nil
+	})
+	go ac.obtainLoop()
+
+	ln, err := NewQUICServer("127.0.0.1:0", ServerTLSConfigDynamic(ac.GetCertificate, echProv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			if _, err := ln.Accept(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+
+	tlsCfg := ClientTLSConfig("localhost", nil)
+	tlsCfg.RootCAs = pool
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := NewQUICClient(ctx, ln.Addr().String(), tlsCfg); err == nil {
+		t.Fatal("handshake must fail while the certificate is not ready")
+	} else if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("handshake blocked %v instead of failing fast: %v", d, err)
+	}
+
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for !ac.ready.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	conn, err := NewQUICClient(ctx, ln.Addr().String(), tlsCfg)
+	if err != nil {
+		t.Fatalf("handshake after certificate is ready: %v", err)
+	}
+	conn.CloseWithError(0, "") //nolint:errcheck
+}
+
+// TestStatelessResetAfterRestart: a client whose server restarted must learn
+// the old connection is dead promptly, not after the idle timeout.
+func TestStatelessResetAfterRestart(t *testing.T) {
+	cert, pool := generateTestCert(t)
+	echProv, err := echpkg.NewProvider("example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsSrv := ServerTLSConfig(cert, echProv)
+	key := statelessResetKey(testPassword)
+
+	ln, udpConn, err := listenQUIC("127.0.0.1:0", tlsSrv, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	accepted := make(chan *quic.Conn, 1)
+	go func() {
+		c, err := ln.Accept(context.Background())
+		if err == nil {
+			accepted <- c
+		}
+	}()
+
+	tlsCfg := ClientTLSConfig("localhost", nil)
+	tlsCfg.RootCAs = pool
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := NewQUICClient(ctx, addr, tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseWithError(0, "") //nolint:errcheck
+	<-accepted
+
+	// "Restart" like a killed process: the socket vanishes without sending
+	// anything, then a new server listens on the same port with the same
+	// (password-derived) key.
+	udpConn.Close()
+	time.Sleep(50 * time.Millisecond)
+	if conn.Context().Err() != nil {
+		t.Fatal("client noticed the kill before the restart; test is not exercising resets")
+	}
+	ln2, err := newQUICListener(addr, tlsSrv, key)
+	if err != nil {
+		t.Fatalf("rebind %s: %v", addr, err)
+	}
+	defer ln2.Close()
+
+	// A new request: the auth header alone makes the packet large enough
+	// (> 42 bytes) for the server to answer with a stateless reset.
+	st, err := conn.OpenStreamSync(ctx)
+	if err == nil {
+		st.Write(make([]byte, 100)) //nolint:errcheck
+	}
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("client kept a dead connection after server restart")
+	}
+}

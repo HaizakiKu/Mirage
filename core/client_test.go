@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -336,5 +337,31 @@ func TestAuthPartialHeader(t *testing.T) {
 	case <-mock.called:
 	case <-time.After(shortTimeout + time.Second):
 		t.Error("partial header stalled the server instead of falling back to masquerade")
+	}
+}
+
+// TestClientDialNoReply: when nothing answers over UDP, the error names the
+// server and points at the firewall instead of a stream problem.
+func TestClientDialNoReply(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0") // swallows packets, never replies
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	c, err := NewClient(&config.ClientConfig{Server: pc.LocalAddr().String(), Password: testPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.handshakeTimeout = 300 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err = c.openStream(ctx)
+	if err == nil {
+		t.Fatal("expected dial to fail")
+	}
+	if msg := err.Error(); !strings.Contains(msg, "connect to server "+pc.LocalAddr().String()) || !strings.Contains(msg, "UDP port") {
+		t.Errorf("unhelpful error: %v", err)
 	}
 }
