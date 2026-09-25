@@ -6,60 +6,38 @@
 package congestion
 
 import (
-	"time"
-
 	"github.com/quic-go/quic-go"
 )
 
-// ccSetter is the interface that quic-go's *Conn must satisfy for
-// custom congestion control injection. This matches quic-go's internal
-// SetCongestionControlEx method exposed on the concrete *Conn type.
-//
-// NOTE: This type assertion requires quic-go to expose SetCongestionControlEx.
-// With vanilla quic-go v0.57.1, this method may not be present; use a fork
-// that exports it if needed. See go.mod for the replace directive comment.
-type ccSetter interface {
-	SetCongestionControlEx(cc congestionControlEx)
-}
-
-// congestionControlEx is the interface that must match quic-go's internal
-// congestion.CongestionControlEx interface exactly.
-type congestionControlEx interface {
-	OnPacketSent(time.Time, ByteCount, PacketNumber, ByteCount, bool)
-	CanSend(ByteCount) bool
-	GetCongestionWindow() ByteCount
-	OnPacketAcked(PacketNumber, ByteCount, ByteCount, time.Time)
-	OnCongestionEvent(PacketNumber, ByteCount, ByteCount)
-	OnRetransmissionTimeout(bool)
-	MaybeExitSlowStart()
-	InSlowStart() bool
-	InRecovery() bool
-	HasPacingBudget(time.Time) bool
-	TimeUntilSend() time.Time
-}
-
-// Ensure our senders implement the interface.
-var _ congestionControlEx = (*bbrSender)(nil)
-var _ congestionControlEx = (*jitterWrapper)(nil)
+// Our senders implement quic-go's pluggable congestion controller interface,
+// which the Mirage quic-go fork exposes via (*quic.Conn).SetCongestionControl.
+// If the fork (see the replace directive in go.mod) ever drops that hook,
+// this fails to compile instead of silently leaving quic-go's default Reno in place.
+var (
+	_ quic.CongestionControl = (*bbrSender)(nil)
+	_ quic.CongestionControl = (*jitterWrapper)(nil)
+)
 
 // UseBBR sets Hysteria2-adapted BBR as the congestion controller for conn.
 // Adapted from github.com/apernet/hysteria (Apache 2.0).
 func UseBBR(conn *quic.Conn) {
-	sender := newBBRSender(maxDatagramSize)
-	setCC(conn, sender)
+	installBBR(conn, nil)
 }
 
 // UseJitteredBBR sets BBR + smooth EMA jitter as the congestion controller.
 // This is Mirage's extension on top of Hysteria2's BBR for anti-censorship use.
 // Call this instead of UseBBR() to obscure the mechanical flat-throughput BBR signature.
 func UseJitteredBBR(conn *quic.Conn, cfg JitterConfig) {
-	sender := newBBRSender(maxDatagramSize)
-	jittered := newJitterWrapper(sender, cfg)
-	setCC(conn, jittered)
+	installBBR(conn, &cfg)
 }
 
-func setCC(conn *quic.Conn, cc congestionControlEx) {
-	if s, ok := any(conn).(ccSetter); ok {
-		s.SetCongestionControlEx(cc)
+// installBBR installs BBR (optionally jittered) on conn and returns the installed controller.
+// The controller takes effect before the connection sends its next packet.
+func installBBR(conn *quic.Conn, jitter *JitterConfig) quic.CongestionControl {
+	var cc quic.CongestionControl = newBBRSender(maxDatagramSize)
+	if jitter != nil {
+		cc = newJitterWrapper(cc, *jitter)
 	}
+	conn.SetCongestionControl(cc)
+	return cc
 }

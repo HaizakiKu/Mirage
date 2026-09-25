@@ -4,6 +4,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // JitterConfig controls the jitter parameters for Mirage's anti-fingerprint layer.
@@ -13,6 +15,11 @@ type JitterConfig struct {
 	// Smoothing is the EMA coefficient, e.g. 0.3 (lower = smoother transitions).
 	Smoothing float64
 }
+
+// jitterStepInterval is the minimum time between two EMA steps. Steps are driven
+// by ACKs, so the multiplier drifts on the timescale of round trips instead of
+// changing with every packet (which would average the jitter out).
+const jitterStepInterval = 100 * time.Millisecond
 
 // DefaultJitterConfig is the recommended configuration for anti-censorship use.
 var DefaultJitterConfig = JitterConfig{
@@ -30,14 +37,15 @@ var DefaultJitterConfig = JitterConfig{
 // The result is a gently drifting rate curve that mimics human-driven browsing
 // behaviour rather than mechanical BBR's flat throughput line.
 type jitterWrapper struct {
-	inner         congestionControlEx
+	inner         quic.CongestionControl
 	cfg           JitterConfig
 	currentJitter float64
+	lastStep      time.Time
 	rng           *rand.Rand
 	mu            sync.Mutex
 }
 
-func newJitterWrapper(inner congestionControlEx, cfg JitterConfig) *jitterWrapper {
+func newJitterWrapper(inner quic.CongestionControl, cfg JitterConfig) *jitterWrapper {
 	if cfg.Smoothing <= 0 || cfg.Smoothing >= 1 {
 		cfg.Smoothing = DefaultJitterConfig.Smoothing
 	}
@@ -72,19 +80,19 @@ func (j *jitterWrapper) applyJitter(v ByteCount) ByteCount {
 	return result
 }
 
-// --- congestionControlEx interface ---
+// --- quic.CongestionControl interface ---
 
 func (j *jitterWrapper) OnPacketSent(sentTime time.Time, bytesInFlight ByteCount, pktNum PacketNumber, bytes ByteCount, isAck bool) {
 	j.inner.OnPacketSent(sentTime, bytesInFlight, pktNum, bytes, isAck)
 }
 
+// CanSend applies the jittered window, so the jitter actually shapes the sending rate.
 func (j *jitterWrapper) CanSend(bytesInFlight ByteCount) bool {
-	return j.inner.CanSend(bytesInFlight)
+	return bytesInFlight < j.GetCongestionWindow()
 }
 
 func (j *jitterWrapper) GetCongestionWindow() ByteCount {
 	j.mu.Lock()
-	j.advanceJitter()
 	scale := j.jitterScale()
 	j.mu.Unlock()
 
@@ -98,6 +106,13 @@ func (j *jitterWrapper) GetCongestionWindow() ByteCount {
 
 func (j *jitterWrapper) OnPacketAcked(pktNum PacketNumber, ackedBytes ByteCount, priorInFlight ByteCount, eventTime time.Time) {
 	j.inner.OnPacketAcked(pktNum, ackedBytes, priorInFlight, eventTime)
+
+	j.mu.Lock()
+	if eventTime.Sub(j.lastStep) >= jitterStepInterval {
+		j.advanceJitter()
+		j.lastStep = eventTime
+	}
+	j.mu.Unlock()
 }
 
 func (j *jitterWrapper) OnCongestionEvent(pktNum PacketNumber, lostBytes ByteCount, priorInFlight ByteCount) {
@@ -124,8 +139,12 @@ func (j *jitterWrapper) HasPacingBudget(now time.Time) bool {
 	return j.inner.HasPacingBudget(now)
 }
 
-func (j *jitterWrapper) TimeUntilSend() time.Time {
-	return j.inner.TimeUntilSend()
+func (j *jitterWrapper) TimeUntilSend(bytesInFlight ByteCount) time.Time {
+	return j.inner.TimeUntilSend(bytesInFlight)
+}
+
+func (j *jitterWrapper) SetMaxDatagramSize(size ByteCount) {
+	j.inner.SetMaxDatagramSize(size)
 }
 
 // PacingRate returns the jitter-adjusted pacing rate for the given base rate.

@@ -9,13 +9,15 @@ import (
 	"math"
 	"math/rand"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
-// ByteCount mirrors quic-go/internal/protocol.ByteCount (int64 underlying type).
-type ByteCount int64
+// ByteCount is quic-go's byte count type.
+type ByteCount = quic.ByteCount
 
-// PacketNumber mirrors quic-go/internal/protocol.PacketNumber (int64 underlying type).
-type PacketNumber int64
+// PacketNumber is quic-go's packet number type.
+type PacketNumber = quic.PacketNumber
 
 // Bandwidth in bytes per second.
 type Bandwidth int64
@@ -27,7 +29,7 @@ const (
 	initialCwnd     ByteCount = 32 * maxDatagramSize
 
 	// BBR gains
-	highGain             = 2.885    // ln(2) ≈ 2.885 for STARTUP
+	highGain             = 2.885 // ln(2) ≈ 2.885 for STARTUP
 	drainGain            = 1 / 2.885
 	probeBWCycleLength   = 8
 	startupGrowthTarget  = 1.25
@@ -44,7 +46,7 @@ var probeBWPacingGains = [probeBWCycleLength]float64{
 type bbrMode int
 
 const (
-	bbrStartup  bbrMode = iota
+	bbrStartup bbrMode = iota
 	bbrDrain
 	bbrProbeBW
 	bbrProbeRTT
@@ -122,8 +124,8 @@ func (f *windowedFilter) get() Bandwidth { return f.best[0] }
 
 // bandwidthSampler estimates bandwidth from acked packets.
 type bandwidthSampler struct {
-	totalBytesSent        ByteCount
-	totalBytesAcked       ByteCount
+	totalBytesSent          ByteCount
+	totalBytesAcked         ByteCount
 	totalBytesSentAtLastAck ByteCount
 	lastAckedPacketSentTime time.Time
 	lastAckedPacketAckTime  time.Time
@@ -188,9 +190,9 @@ type bbrSender struct {
 	lastCycleStart     time.Time
 
 	// PROBE_RTT
-	probingForRTT       bool
-	probeRTTRoundsDone  int
-	probeRTTEndTime     time.Time
+	probingForRTT        bool
+	probeRTTRoundsDone   int
+	probeRTTEndTime      time.Time
 	minRTTSinceLastProbe time.Duration
 
 	// Recovery
@@ -203,6 +205,9 @@ type bbrSender struct {
 
 	// Timing
 	lastSentTime time.Time
+
+	// Current max datagram size, updated by quic-go (e.g. after path MTU discovery).
+	datagramSize ByteCount
 }
 
 func newBBRSender(initialMaxDatagramSize ByteCount) *bbrSender {
@@ -217,6 +222,7 @@ func newBBRSender(initialMaxDatagramSize ByteCount) *bbrSender {
 		cwndGain:         highGain,
 		congestionWindow: initialCwnd,
 		maxCwnd:          initialCwnd * 100,
+		datagramSize:     initialMaxDatagramSize,
 	}
 	s.minRTTSinceLastProbe = math.MaxInt64
 	return s
@@ -238,8 +244,8 @@ func (s *bbrSender) targetCongestionWindow(gain float64) ByteCount {
 	}
 	bdp := ByteCount(float64(bw) * rtt.Seconds())
 	cwnd := ByteCount(gain * float64(bdp))
-	if cwnd < 4*maxDatagramSize {
-		cwnd = 4 * maxDatagramSize
+	if cwnd < 4*s.datagramSize {
+		cwnd = 4 * s.datagramSize
 	}
 	return cwnd
 }
@@ -266,7 +272,7 @@ func (s *bbrSender) CanSend(bytesInFlight ByteCount) bool {
 
 func (s *bbrSender) GetCongestionWindow() ByteCount {
 	if s.mode == bbrProbeRTT {
-		return 4 * maxDatagramSize
+		return 4 * s.datagramSize
 	}
 	if s.recoveryState != recoveryNotStarted && s.recoveryWindow < s.congestionWindow {
 		return s.recoveryWindow
@@ -423,9 +429,9 @@ func (s *bbrSender) updateCongestionWindow(ackedBytes ByteCount) {
 	} else {
 		// Approach target smoothly
 		if s.congestionWindow < target {
-			s.congestionWindow += maxDatagramSize
-		} else if s.congestionWindow > target+maxDatagramSize {
-			s.congestionWindow -= maxDatagramSize
+			s.congestionWindow += s.datagramSize
+		} else if s.congestionWindow > target+s.datagramSize {
+			s.congestionWindow -= s.datagramSize
 		}
 	}
 
@@ -443,8 +449,8 @@ func (s *bbrSender) OnCongestionEvent(pktNum PacketNumber, lostBytes ByteCount, 
 		s.recoveryState = recoveryConservation
 		s.endRecoveryAt = s.lastSentPacket
 		s.recoveryWindow = priorInFlight - lostBytes
-		if s.recoveryWindow < 2*maxDatagramSize {
-			s.recoveryWindow = 2 * maxDatagramSize
+		if s.recoveryWindow < 2*s.datagramSize {
+			s.recoveryWindow = 2 * s.datagramSize
 		}
 	}
 }
@@ -474,6 +480,10 @@ func (s *bbrSender) HasPacingBudget(now time.Time) bool {
 	return true
 }
 
-func (s *bbrSender) TimeUntilSend() time.Time {
+func (s *bbrSender) TimeUntilSend(bytesInFlight ByteCount) time.Time {
 	return time.Time{}
+}
+
+func (s *bbrSender) SetMaxDatagramSize(size ByteCount) {
+	s.datagramSize = size
 }
